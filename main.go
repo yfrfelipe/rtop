@@ -27,7 +27,7 @@ package main
 
 import (
 	"fmt"
-	"golang.org/x/crypto/ssh"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -38,17 +38,21 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 )
 
 const VERSION = "1.0"
 const DEFAULT_REFRESH = 5 // default refresh interval in seconds
+
+var currentUser *user.User
 
 //----------------------------------------------------------------------------
 // Command-line processing
 
 func usage(code int) {
 	fmt.Printf(
-`rtop %s - (c) 2015 RapidLoop - MIT Licensed - http://rtop-monitor.org
+		`rtop %s - (c) 2015 RapidLoop - MIT Licensed - http://rtop-monitor.org
 rtop monitors server statistics over an ssh connection
 
 Usage: rtop [-i private-key-file] [user@]host[:port] [interval]
@@ -73,7 +77,7 @@ func shift(q []string) (ok bool, val string, qnew []string) {
 	return
 }
 
-func parseCmdLine() (key, username, addr string, interval time.Duration) {
+func parseCmdLine() (host string, port int, user, key string, interval time.Duration) {
 	ok, arg, args := shift(os.Args)
 	var argKey, argHost, argInt string
 	for ok {
@@ -102,44 +106,53 @@ func parseCmdLine() (key, username, addr string, interval time.Duration) {
 	}
 
 	// key
-	usr, err := user.Current()
-	if err != nil {
-		log.Print(err)
-		usage(1)
-	}
-	if len(argKey) == 0 {
-		key = filepath.Join(usr.HomeDir, ".ssh", "id_rsa")
-		if _, err := os.Stat(key); os.IsNotExist(err) {
-			key = ""
-		}
-	} else {
+	if len(argKey) != 0 {
 		key = argKey
-	}
-	// username, addr
+	} // else key remains ""
+
+	// user, addr
+	var addr string
 	if i := strings.Index(argHost, "@"); i != -1 {
-		username = argHost[:i]
+		user = argHost[:i]
 		if i+1 >= len(argHost) {
 			usage(1)
 		}
 		addr = argHost[i+1:]
 	} else {
-		username = usr.Username
+		// user remains ""
 		addr = argHost
 	}
-	if i := strings.Index(addr, ":"); i == -1 {
-		addr += ":22"
-	}
-	// interval
-	if len(argInt) == 0 {
-		interval = DEFAULT_REFRESH * time.Second
+
+	// addr -> host, port
+	if p := strings.Split(addr, ":"); len(p) == 2 {
+		host = p[0]
+		var err error
+		if port, err = strconv.Atoi(p[1]); err != nil {
+			log.Printf("bad port: %v", err)
+			usage(1)
+		}
+		if port <= 0 || port >= 65536 {
+			log.Printf("bad port: %d", port)
+			usage(1)
+		}
 	} else {
+		host = addr
+		// port remains 0
+	}
+
+	// interval
+	if len(argInt) > 0 {
 		i, err := strconv.ParseUint(argInt, 10, 64)
 		if err != nil {
-			log.Print(err)
+			log.Printf("bad interval: %v", err)
+			usage(1)
+		}
+		if i <= 0 {
+			log.Printf("bad interval: %d", i)
 			usage(1)
 		}
 		interval = time.Duration(i) * time.Second
-	}
+	} // else interval remains 0
 
 	return
 }
@@ -151,12 +164,64 @@ func main() {
 	log.SetPrefix("rtop: ")
 	log.SetFlags(0)
 
-	keyPath, username, addr, interval := parseCmdLine()
+	// get params from command line
+	host, port, username, key, interval := parseCmdLine()
+	// log.Printf("cmdline: %s %d %s %s", host, port, username, key)
 
-	client := sshConnect(username, addr, keyPath)
+	// get current user
+	var err error
+	currentUser, err = user.Current()
+	if err != nil {
+		log.Print(err)
+		return
+	}
 
+	// fill from ~/.ssh/config if possible
+	sshConfig := filepath.Join(currentUser.HomeDir, ".ssh", "config")
+	if _, err := os.Stat(sshConfig); err == nil {
+		if parseSshConfig(sshConfig) {
+			shost, sport, suser, skey := getSshEntry(host)
+			if len(shost) > 0 {
+				host = shost
+			}
+			if sport != 0 && port == 0 {
+				port = sport
+			}
+			if len(suser) > 0 && len(username) == 0 {
+				username = suser
+			}
+			if len(skey) > 0 && len(key) == 0 {
+				key = skey
+			}
+			// log.Printf("after sshconfig: %s %d %s %s", host, port, username, key)
+		}
+	}
+
+	// fill in still-unknown ones with defaults
+	if port == 0 {
+		port = 22
+	}
+	if len(username) == 0 {
+		username = currentUser.Username
+	}
+	if len(key) == 0 {
+		idrsap := filepath.Join(currentUser.HomeDir, ".ssh", "id_rsa")
+		if _, err := os.Stat(idrsap); err == nil {
+			key = idrsap
+		}
+	}
+	if interval == 0 {
+		interval = DEFAULT_REFRESH * time.Second
+	}
+	// log.Printf("after defaults: %s %d %s %s", host, port, username, key)
+	// log.Printf("interval: %v", interval)
+
+	addr := fmt.Sprintf("%s:%d", host, port)
+	client := sshConnect(username, addr, key)
+
+	output := getOutput()
 	// the loop
-	showStats(client)
+	showStats(output, client)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 	timer := time.Tick(interval)
@@ -165,21 +230,26 @@ func main() {
 		select {
 		case <-sig:
 			done = true
+			fmt.Println()
 		case <-timer:
-			showStats(client)
+			showStats(output, client)
 		}
 	}
 }
 
-func showStats(client *ssh.Client) {
+func showStats(output io.Writer, client *ssh.Client) {
 	stats := Stats{}
 	getAllStats(client, &stats)
+	clearConsole()
 	used := stats.MemTotal - stats.MemFree - stats.MemBuffers - stats.MemCached
-	fmt.Printf(
-`%s%s%s%s up %s%s%s
+	fmt.Fprintf(output,
+		`%s%s%s%s up %s%s%s
 
 Load:
     %s%s %s %s%s
+
+CPU:
+    %s%.2f%s%% user, %s%.2f%s%% sys, %s%.2f%s%% nice, %s%.2f%s%% idle, %s%.2f%s%% iowait, %s%.2f%s%% hardirq, %s%.2f%s%% softirq, %s%.2f%s%% guest
 
 Processes:
     %s%s%s running of %s%s%s total
@@ -196,6 +266,14 @@ Memory:
 		escBrightWhite, stats.Hostname, escReset,
 		escBrightWhite, fmtUptime(&stats), escReset,
 		escBrightWhite, stats.Load1, stats.Load5, stats.Load10, escReset,
+		escBrightWhite, stats.CPU.User, escReset,
+		escBrightWhite, stats.CPU.System, escReset,
+		escBrightWhite, stats.CPU.Nice, escReset,
+		escBrightWhite, stats.CPU.Idle, escReset,
+		escBrightWhite, stats.CPU.Iowait, escReset,
+		escBrightWhite, stats.CPU.Irq, escReset,
+		escBrightWhite, stats.CPU.SoftIrq, escReset,
+		escBrightWhite, stats.CPU.Guest, escReset,
 		escBrightWhite, stats.RunningProcs, escReset,
 		escBrightWhite, stats.TotalProcs, escReset,
 		escBrightWhite, fmtBytes(stats.MemFree), escReset,
@@ -208,7 +286,7 @@ Memory:
 	if len(stats.FSInfos) > 0 {
 		fmt.Println("Filesystems:")
 		for _, fs := range stats.FSInfos {
-			fmt.Printf("    %s%8s%s: %s%s%s free of %s%s%s\n",
+			fmt.Fprintf(output, "    %s%8s%s: %s%s%s free of %s%s%s\n",
 				escBrightWhite, fs.MountPoint, escReset,
 				escBrightWhite, fmtBytes(fs.Free), escReset,
 				escBrightWhite, fmtBytes(fs.Used+fs.Free), escReset,
@@ -225,12 +303,18 @@ Memory:
 		sort.Strings(keys)
 		for _, intf := range keys {
 			info := stats.NetIntf[intf]
-			fmt.Printf("    %s%s%s - %s%s%s, %s%s%s\n",
+			fmt.Fprintf(output, "    %s%s%s - %s%s%s",
 				escBrightWhite, intf, escReset,
 				escBrightWhite, info.IPv4, escReset,
-				escBrightWhite, info.IPv6, escReset,
 			)
-			fmt.Printf("      rx = %s%s%s, tx = %s%s%s\n",
+			if len(info.IPv6) > 0 {
+				fmt.Fprintf(output, ", %s%s%s\n",
+					escBrightWhite, info.IPv6, escReset,
+				)
+			} else {
+				fmt.Fprintf(output, "\n")
+			}
+			fmt.Fprintf(output, "      rx = %s%s%s, tx = %s%s%s\n",
 				escBrightWhite, fmtBytes(info.Rx), escReset,
 				escBrightWhite, fmtBytes(info.Tx), escReset,
 			)
