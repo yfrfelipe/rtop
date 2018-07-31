@@ -29,16 +29,17 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
-	"os/signal"
 	"os/user"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -219,22 +220,36 @@ func main() {
 	addr := fmt.Sprintf("%s:%d", host, port)
 	client := sshConnect(username, addr, key)
 
-	output := getOutput()
-	// the loop
-	showStats(output, client)
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
-	timer := time.Tick(interval)
-	done := false
-	for !done {
-		select {
-		case <-sig:
-			done = true
-			fmt.Println()
-		case <-timer:
-			showStats(output, client)
-		}
-	}
+	collector := newCollector(client)
+	prometheus.MustRegister(collector)
+
+	fmt.Println("Starting listener")
+	http.Handle("/metrics", promhttp.Handler())
+	http.ListenAndServe(":8080", nil)
+	// output := getOutput()
+	// // the loop
+	// showStats(output, client)
+	// sig := make(chan os.Signal, 1)
+	// signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
+	// timer := time.Tick(interval)
+	// done := false
+	// for !done {
+	// 	select {
+	// 	case <-sig:
+	// 		done = true
+	// 		fmt.Println()
+	// 	case <-timer:
+	// 		showStats(output, client)
+	// 	}
+	// }
+}
+
+func collectStats(ch chan Stats, client *ssh.Client) {
+
+	stats := Stats{}
+	getAllStats(client, &stats)
+
+	ch <- stats
 }
 
 func showStats(output io.Writer, client *ssh.Client) {
